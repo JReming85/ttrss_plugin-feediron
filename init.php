@@ -397,37 +397,85 @@ class Feediron extends Plugin implements IHandler
 		$retlinks = array();
 		foreach($links as $lnk)
 		{
-			$retlinks[] = $this->rel2abs($lnk, $link);
+			$retlinks[] = $this->resolve_url($link, $lnk);
 		}
 		return $retlinks;
 	}
 
-	function rel2abs($rel, $base)
-	{
-		if (parse_url($rel, PHP_URL_SCHEME) != '' || substr($rel, 0, 2) == '//') {
-			return $rel;
-		}
-		if ($rel[0]=='#' || $rel[0]=='?') {
-			return $base.$rel;
-		}
-		Feediron_Logger::get()->log(Feediron_Logger::LOG_VERBOSE, "Transform url for base ".$base, $rel);
-		extract(parse_url($base));
-		$path = preg_replace('#/[^/]*$#', '', $path);
-		if ($rel[0] == '/') {
-			$path = '';
-		}
+	/**
+	* Does the reverse of parse_url (creates a URL from an associative array of components)
+	*/
+	function unparse_url($parsed_url) {
+		$scheme   = isset($parsed_url['scheme']) ? $parsed_url['scheme'] . '://' : '';
+		$host     = isset($parsed_url['host']) ? $parsed_url['host'] : '';
+		$port     = isset($parsed_url['port']) ? ':' . $parsed_url['port'] : '';
+		$user     = isset($parsed_url['user']) ? $parsed_url['user'] : '';
+		$pass     = isset($parsed_url['pass']) ? ':' . $parsed_url['pass']  : '';
+		$pass     = ($user || $pass) ? "$pass@" : '';
+		$path     = isset($parsed_url['path']) ? $parsed_url['path'] : '';
+		$query    = isset($parsed_url['query']) ? '?' . $parsed_url['query'] : '';
+		$fragment = isset($parsed_url['fragment']) ? '#' . $parsed_url['fragment'] : '';
+		return "$scheme$user$pass$host$port$path$query$fragment";
+	}
 
-		/* dirty absolute URL */
-		$abs = "$host$path/$rel";
-
-		/* replace '//' or '/./' or '/foo/../' with '/' */
-		$re = array('#(/\.?/)#', '#/(?!\.\.)[^/]+/\.\./#');
-		for($n=1; $n>0; $abs=preg_replace($re, '/', $abs, -1, $n)) {}
-
-			Feediron_Logger::get()->log(Feediron_Logger::LOG_VERBOSE, "Transform result ", $scheme.'://'.$abs);
-				/* absolute URL is ready! */
-				return $scheme.'://'.$abs;
+	/**
+	* Resolve a URL relative to a base path. Based on RFC 2396 section 5.2.
+	*/
+	function resolve_url($base, $url) {
+		if (!strlen($base)) return $url;
+		// Step 2
+		if (!strlen($url)) return $base;
+		// Step 3
+		if (preg_match('!^[a-z]+:!i', $url)) return $url;
+		$base = parse_url($base);
+		if ($url{0} == "#") {
+			// Step 2 (fragment)
+			$base['fragment'] = substr($url, 1);
+			return $this->unparse_url($base);
+		}
+		unset($base['fragment']);
+		unset($base['query']);
+		if (substr($url, 0, 2) == "//") {
+			// Step 4
+			return $this->unparse_url(array(
+				'scheme'=>$base['scheme'],
+				'path'=>substr($url,2),
+			));
+		} else if ($url{0} == "/") {
+			// Step 5
+			$base['path'] = $url;
+		} else {
+			// Step 6
+			$path = explode('/', isset($base['path']) ? $base['path'] : "");
+			$url_path = explode('/', $url);
+			// Step 6a: drop file from base
+			array_pop($path);
+			// Step 6b, 6c, 6e: append url while removing "." and ".." from
+			// the directory portion
+			$end = array_pop($url_path);
+			foreach ($url_path as $segment) {
+				if ($segment == '.') {
+					// skip
+				} else if ($segment == '..' && $path && $path[sizeof($path)-1] != '..') {
+					array_pop($path);
+				} else {
+					$path[] = $segment;
+				}
 			}
+			// Step 6d, 6f: remove "." and ".." from file portion
+			if ($end == '.') {
+				$path[] = '';
+			} else if ($end == '..' && $path && $path[sizeof($path)-1] != '..') {
+				$path[sizeof($path)-1] = '';
+			} else {
+				$path[] = $end;
+			}
+			// Step 6h
+			$base['path'] = join('/', $path);
+		}
+		// Step 7
+		return $this->unparse_url($base);
+	}
 
 	function processArticle($html, $config, $link)
 	{
@@ -447,7 +495,7 @@ class Feediron extends Plugin implements IHandler
 
 			default:
 			Feediron_Logger::get()->log(Feediron_Logger::LOG_TTRSS, "Unrecognized option: ".$config['type']);
-			continue;
+			break;
 		}
 		if(is_array($config['modify']))
 		{
@@ -539,10 +587,25 @@ class Feediron extends Plugin implements IHandler
 			}
 			else {
 				$content = $readability->getContent()->innerHTML;
+				Feediron_Logger::get()->log_html(Feediron_Logger::LOG_VERBOSE, "Readability modified Source ".$lnk.":", $html);
 			}
 		}
-		return $content;
-
+		// Perform xpath on readability output
+		if (isset($config['xpath'])){
+			$html = $this->performXpath($content, $config);
+		// If no xpath for readability output perform simple cleanup
+		} elseif(($cconfig = $this->getCleanupConfig($config))!== FALSE) {
+			$html = $content;
+			foreach($cconfig as $cleanup){
+				Feediron_Logger::get()->log(Feediron_Logger::LOG_VERBOSE, "Cleaning up", $cleanup);
+				$html = preg_replace($cleanup, '', $html);
+				Feediron_Logger::get()->log_html(Feediron_Logger::LOG_VERBOSE, "cleanup  result", $html);
+			}
+		} else {
+			// If no extra config just return the content
+			$html = $content;
+		}
+		return $html;
 	}
 
 	function performSplit($html, $config){
@@ -567,9 +630,9 @@ class Feediron extends Plugin implements IHandler
 			Feediron_Logger::get()->log(Feediron_Logger::LOG_VERBOSE, "removed all content, reverting");
 			return $orig_html;
 		}
-		if(isset($config['cleanup']))
+		if(($cconfig = $this->getCleanupConfig($config))!== FALSE)
 		{
-			foreach($config['cleanup'] as $cleanup)
+			foreach($cconfig as $cleanup)
 			{
 				Feediron_Logger::get()->log(Feediron_Logger::LOG_VERBOSE, "Cleaning up", $cleanup);
 				$html = preg_replace($cleanup, '', $html);
@@ -593,7 +656,9 @@ class Feediron extends Plugin implements IHandler
 
 		$htmlout = array();
 
-		foreach($xpaths as $key=>$xpath){
+		//foreach($xpaths as $key=>$xpath){
+		foreach($xpaths as $xpath){
+			Feediron_Logger::get()->log(Feediron_Logger::LOG_VERBOSE, "Perfoming xpath", $xpath);
 			$index = 0;
 			if(is_array($xpath) && array_key_exists('index', $xpath)){
 				$index = $xpath['index'];
@@ -624,13 +689,18 @@ class Feediron extends Plugin implements IHandler
 				}
 				array_push($htmlout, $inner_html);
 			}
+
 			$content = join((array_key_exists('join_element', $config)?$config['join_element']:''), $htmlout);
 			if(array_key_exists('start_element', $config)){
+				Feediron_Logger::get()->log_html(Feediron_Logger::LOG_VERBOSE, "Adding start element", $config['start_element']);
 				$content = $config['start_element'].$content;
 			}
+
 			if(array_key_exists('end_element', $config)){
+				Feediron_Logger::get()->log_html(Feediron_Logger::LOG_VERBOSE, "Adding end element", $config['end_element']);
 				$content = $content.$config['end_element'];
 			}
+
 			return $content;
 		}
 
@@ -825,13 +895,15 @@ class Feediron extends Plugin implements IHandler
 			}
 
 			$config = $this->getConfigSection($test_url);
-			Feediron_Logger::get()->log_object(Feediron_Logger::LOG_TEST, "config found: ", $config);
 			$newconfig = json_decode($_POST['test_conf'], true);
 			Feediron_Logger::get()->log_object(Feediron_Logger::LOG_TEST, "config posted: ", $newconfig);
-			Feediron_Logger::get()->log_object(Feediron_Logger::LOG_TEST, "config diff", $this->arrayRecursiveDiff($config, $newconfig));
-			if(count($this->arrayRecursiveDiff($newconfig, $config))!= 0){
-				Feediron_Logger::get()->log(Feediron_Logger::LOG_TEST, "Save test config");
-				$this->host->set($this, 'test_conf', Feediron_Json::format(json_encode($config)));
+			if($config != False){
+				Feediron_Logger::get()->log_object(Feediron_Logger::LOG_TEST, "config found: ", $config);
+				Feediron_Logger::get()->log_object(Feediron_Logger::LOG_TEST, "config diff", $this->arrayRecursiveDiff($config, $newconfig));
+				if(count($this->arrayRecursiveDiff($newconfig, $config))!= 0){
+					Feediron_Logger::get()->log(Feediron_Logger::LOG_TEST, "Save test config");
+					$this->host->set($this, 'test_conf', Feediron_Json::format(json_encode($config)));
+				}
 			}
 			$config = json_decode($_POST['test_conf'], true);
 		}else{
